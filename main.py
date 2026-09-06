@@ -11,10 +11,14 @@ from agent.graph import create_agent_graph, extract_interrupt_data
 
 load_dotenv()
 
-# 1. KHỞI TẠO LLM CLIENTS
+# 1. KHỞI TẠO VÀ KIỂM TRA MÔI TRƯỜNG
 api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise RuntimeError("❌ Missing OPENAI_API_KEY environment variable. Vui lòng cấu hình file .env trước khi chạy.")
+INVALID_KEYS = {"", "your_openai_api_key_here", "none", "null"}
+
+if not api_key or api_key.strip().lower() in INVALID_KEYS:
+    raise RuntimeError(
+        "❌ OPENAI_API_KEY không hợp lệ hoặc chưa được cấu hình đúng trong file .env."
+    )
 
 llm_strong = ChatOpenAI(model="gpt-4o", temperature=0.0, api_key=api_key)
 llm_cheap = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=api_key)
@@ -30,33 +34,59 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 
 checkpointer = SqliteSaver(conn)
 
+# Tự quản lý thời gian hoàn tất session để dọn dẹp an toàn
+conn.execute("""
+    CREATE TABLE IF NOT EXISTS session_completions (
+        thread_id TEXT PRIMARY KEY,
+        completed_at TEXT NOT NULL
+    )
+""")
+
+
+def _mark_session_completed(thread_id: str):
+    """Lưu vết thời điểm session kết thúc để phục vụ cronjob dọn dẹp."""
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_completions (thread_id, completed_at) VALUES (?, datetime('now'))",
+                (thread_id,)
+            )
+    except Exception as e:
+        print(f"⚠️ [Tracking Error] Không thể đánh dấu hoàn tất cho thread {thread_id}: {e}")
+
 
 # 3. QUẢN LÝ DỌN DẸP & VÒNG ĐỜI DATABASE
 def delete_thread_data(thread_id: str):
-    """Xóa toàn bộ checkpoint history của 1 thread hoàn tất để giải phóng dung lượng."""
+    """Xóa toàn bộ checkpoint history qua API chính thức và dọn bảng tracking."""
     try:
+        # API chuẩn: tự động xử lý mọi bảng nội bộ của LangGraph (checkpoints, blobs, writes...)
+        checkpointer.delete_thread(thread_id)
+
+        # Dọn dẹp tracking nội bộ của chúng ta
         with conn:
-            conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
-            conn.execute("DELETE FROM checkpoint_blobs WHERE thread_id = ?", (thread_id,))
-            conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = ?", (thread_id,))
-        print(f"🧹 [Database Cleanup] Đã xóa checkpoint history của thread: {thread_id}")
+            conn.execute("DELETE FROM session_completions WHERE thread_id = ?", (thread_id,))
+
+        print(f"🧹 [Database Cleanup] Đã xóa toàn bộ dữ liệu của thread: {thread_id}")
     except Exception as e:
         print(f"⚠️ [Database Cleanup Error] Không thể xóa thread {thread_id}: {e}")
 
 
 def cleanup_old_sessions(days_retention: int = 7):
-    """
-    Dọn dẹp các checkpoint cũ hơn N ngày và thực hiện TRUNCATE WAL để gom dung lượng.
-    Phù hợp chạy định kỳ/cronjob khi muốn giữ lại log vài ngày để debug.
-    """
+    """Dọn dẹp các checkpoint cũ dựa trên bảng tracking độc lập."""
     try:
         with conn:
-            conn.execute(
-                "DELETE FROM checkpoints WHERE datetime(timestamp) < datetime('now', '-' || ? || ' days')",
+            rows = conn.execute(
+                "SELECT thread_id FROM session_completions WHERE completed_at < datetime('now', '-' || ? || ' days')",
                 (days_retention,)
-            )
+            ).fetchall()
+
+        for (tid,) in rows:
+            delete_thread_data(tid)
+
+        with conn:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        print(f"🧹 [Database Maintenance] Đã dọn dẹp các phiên cũ hơn {days_retention} ngày.")
+
+        print(f"🧹 [Database Maintenance] Đã dọn dẹp {len(rows)} phiên cũ hơn {days_retention} ngày.")
     except Exception as e:
         print(f"⚠️ [Database Maintenance Error]: {e}")
 
@@ -115,6 +145,9 @@ def start_agent_session(
 
         if auto_cleanup:
             delete_thread_data(thread_id)
+        else:
+            # Ghi nhận thời gian để hàm cleanup_old_sessions() dọn dẹp sau này
+            _mark_session_completed(thread_id)
 
         return res
 
@@ -122,6 +155,8 @@ def start_agent_session(
         print(f"❌ [Fatal Runtime Error in Session {thread_id}]: {str(e)}")
         if auto_cleanup:
             delete_thread_data(thread_id)
+        else:
+            _mark_session_completed(thread_id)
         return {
             "thread_id": thread_id,
             "is_completed": True,
@@ -167,6 +202,9 @@ def resume_agent_session(
 
         if auto_cleanup:
             delete_thread_data(thread_id)
+        else:
+            # Ghi nhận thời gian để hàm cleanup_old_sessions() dọn dẹp sau này
+            _mark_session_completed(thread_id)
 
         return res
 
@@ -174,6 +212,8 @@ def resume_agent_session(
         print(f"❌ [Fatal Runtime Error in Session {thread_id}]: {str(e)}")
         if auto_cleanup:
             delete_thread_data(thread_id)
+        else:
+            _mark_session_completed(thread_id)
         return {
             "thread_id": thread_id,
             "is_completed": True,
