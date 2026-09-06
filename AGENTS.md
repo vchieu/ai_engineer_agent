@@ -49,9 +49,9 @@ ai_engineer_agent/
 ### 1. Data Contracts (`schemas/payload.py`)
 - Mọi dữ liệu luân chuyển giữa các node, Frontend, và LLM Prompts đều tuân thủ duy nhất chuẩn Pydantic trong [`schemas/payload.py`](schemas/payload.py).
 - Key Models:
-  - [`AgentState`](schemas/payload.py:93): State chính chứa lịch sử, tokens, status, input, plan, diagnosis, proposal, sandbox_result, audit_result.
-  - [`CodeFixProposal`](schemas/payload.py:60): Đảm bảo `entrypoint_filename` thuộc danh sách files và khớp với phần mở rộng của `language`.
-  - [`VerifierAudit`](schemas/payload.py:84): Đánh giá độ tin cậy và phản hồi của Verifier Agent.
+  - [`AgentState`](schemas/payload.py:114): State chính chứa lịch sử, tokens, status, input, plan, diagnosis, proposal, sandbox_result, audit_result.
+  - [`CodeFixProposal`](schemas/payload.py:70): Đảm bảo `entrypoint_filename` thuộc danh sách files và khớp với phần mở rộng của `language`.
+  - [`VerifierAudit`](schemas/payload.py:105): Đánh giá độ tin cậy và phản hồi của Verifier Agent.
 
 ### 2. LLM Communication Layer (`llm/safe_call.py`)
 - Hàm [`safe_llm_call()`](llm/safe_call.py:8) bọc gọi `with_structured_output(schema_class)`.
@@ -59,8 +59,12 @@ ai_engineer_agent/
 - Thu thập token usage chi tiết theo model_name và node_name.
 
 ### 3. Isolated Execution Sandbox (`sandbox/docker_runner.py`)
-- Hàm [`execute_in_docker_sandbox()`](sandbox/docker_runner.py:18) chạy mã nguồn được tạo ra bên trong Docker container cách ly (`python:3.11-slim` hoặc `node:20-slim`).
-- Bắt buộc áp dụng giới hạn tài nguyên: `mem_limit="512m"`, `pids_limit=100`, `network_disabled=True`, `tmpfs={'/tmp': 'rw,size=32m,noexec'}`, `timeout_seconds=30`.
+- Hàm [`execute_in_docker_sandbox()`](sandbox/docker_runner.py:30) chạy mã nguồn được tạo ra bên trong Docker container cách ly (`python:3.11-slim` hoặc `node:20-slim`).
+- Bắt buộc áp dụng giới hạn tài nguyên và cấu hình bảo mật nâng cao:
+  - Giới hạn phần cứng: `mem_limit="512m"`, `pids_limit=100`, `nano_cpus=1000000000` (1 CPU core), `timeout_seconds=30`.
+  - Tách biệt môi trường & Network: `network_disabled=True`, `tmpfs={'/tmp': 'rw,size=32m,noexec'}`.
+  - Phân quyền & Bảo mật nâng cao: `user="1000:1000"`, `cap_drop=["ALL"]`, `security_opt=["no-new-privileges:true"]`, `read_only=True` (chỉ cho phép ghi vào thư mục `/app` được mount tạm và `/tmp` của tmpfs).
+  - Ngăn chặn Path Traversal và Safe Tên File: Mọi đường dẫn/file name của Proposal được xác thực thông qua `_is_safe_filename` trong `schemas/payload.py` và gộp đường dẫn cô lập an toàn bằng `_safe_join` trong `sandbox/docker_runner.py`.
 
 ### 4. Graph Architecture (`agent/graph.py` & `agent/nodes.py`)
 - **Node Routing Flow**:
@@ -77,13 +81,13 @@ ai_engineer_agent/
 ### 5. API Services & Persistence (`main.py`)
 - Khởi tạo SQLite Checkpointer ở chế độ **WAL Mode** (`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`).
 - Expose các hàm API wrapper chuẩn:
-  - [`start_agent_session(thread_id, user_input, auto_cleanup=False)`](main.py:83)
-  - [`resume_agent_session(thread_id, user_answer, auto_cleanup=False)`](main.py:141)
-  - [`close_db_connection()`](main.py:68)
+  - [`start_agent_session(thread_id, user_input, auto_cleanup=False)`](main.py:123)
+  - [`resume_agent_session(thread_id, user_answer, auto_cleanup=False)`](main.py:181)
+  - [`close_db_connection()`](main.py:106)
 - **Database Cleanup & Maintenance Helpers** (giải quyết hiện tượng phình `.db`/WAL khi chạy local lâu dài):
-  - [`delete_thread_data(thread_id)`](main.py:42): Xóa trực tiếp checkpoint history của 1 thread bằng SQL (không phụ thuộc phiên bản thư viện).
-  - [`cleanup_old_sessions(days_retention=7)`](main.py:53): Dọn dẹp các checkpoint cũ hơn N ngày và thực hiện `PRAGMA wal_checkpoint(TRUNCATE)` để gom WAL (phù hợp chạy định kỳ/cronjob).
-  - [`close_db_connection()`](main.py:68): Flush WAL vĩnh viễn vào file `.db` chính và đóng kết nối an toàn (sẵn sàng gắn vào FastAPI shutdown event).
+  - [`delete_thread_data(thread_id)`](main.py:71): Xóa trực tiếp checkpoint history của 1 thread bằng API chính thức `checkpointer.delete_thread(thread_id)` (đầy đủ, an toàn, tự động xử lý mọi bảng nội bộ của LangGraph Checkpointer), đồng thời xóa dòng tracking tương ứng trong bảng `session_completions`.
+  - [`cleanup_old_sessions(days_retention=7)`](main.py:86): Dọn dẹp các checkpoint cũ hơn N ngày thông qua bảng theo dõi độc lập `session_completions` (nhằm thay thế cho việc dựa vào cột `timestamp` vốn không tồn tại trong schema nội bộ của SqliteSaver) và thực hiện `PRAGMA wal_checkpoint(TRUNCATE)` để gom WAL (phù hợp chạy định kỳ/cronjob).
+  - [`close_db_connection()`](main.py:106): Flush WAL vĩnh viễn vào file `.db` chính và đóng kết nối an toàn (sẵn sàng gắn vào FastAPI shutdown event).
   - Tham số `auto_cleanup=True` trong `start_agent_session` / `resume_agent_session` sẽ tự động xóa checkpoint của thread ngay khi session kết thúc (hoặc gặp lỗi).
 
 ---

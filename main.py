@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 from typing import Dict, Any, Union, Optional
@@ -10,6 +11,12 @@ from schemas.payload import AgentState
 from agent.graph import create_agent_graph, extract_interrupt_data
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("ai_engineer_agent")
 
 # 1. KHỞI TẠO VÀ KIỂM TRA MÔI TRƯỜNG
 api_key = os.getenv("OPENAI_API_KEY")
@@ -34,6 +41,11 @@ conn.execute("PRAGMA synchronous=NORMAL;")
 
 checkpointer = SqliteSaver(conn)
 
+assert hasattr(checkpointer, "delete_thread"), (
+    "Phiên bản langgraph-checkpoint-sqlite hiện tại không hỗ trợ delete_thread() — "
+    "vui lòng nâng cấp package trước khi chạy (ví dụ: pip install -U 'langgraph-checkpoint>=2.0.25')."
+)
+
 # Tự quản lý thời gian hoàn tất session để dọn dẹp an toàn
 conn.execute("""
     CREATE TABLE IF NOT EXISTS session_completions (
@@ -52,7 +64,7 @@ def _mark_session_completed(thread_id: str):
                 (thread_id,)
             )
     except Exception as e:
-        print(f"⚠️ [Tracking Error] Không thể đánh dấu hoàn tất cho thread {thread_id}: {e}")
+        logger.error(f"[Tracking Error] Không thể đánh dấu hoàn tất cho thread {thread_id}: {e}", exc_info=True)
 
 
 # 3. QUẢN LÝ DỌN DẸP & VÒNG ĐỜI DATABASE
@@ -66,9 +78,9 @@ def delete_thread_data(thread_id: str):
         with conn:
             conn.execute("DELETE FROM session_completions WHERE thread_id = ?", (thread_id,))
 
-        print(f"🧹 [Database Cleanup] Đã xóa toàn bộ dữ liệu của thread: {thread_id}")
+        logger.info(f"🧹 [Database Cleanup] Đã xóa toàn bộ dữ liệu của thread: {thread_id}")
     except Exception as e:
-        print(f"⚠️ [Database Cleanup Error] Không thể xóa thread {thread_id}: {e}")
+        logger.error(f"⚠️ [Database Cleanup Error] Không thể xóa thread {thread_id}: {e}", exc_info=True)
 
 
 def cleanup_old_sessions(days_retention: int = 7):
@@ -86,9 +98,9 @@ def cleanup_old_sessions(days_retention: int = 7):
         with conn:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
 
-        print(f"🧹 [Database Maintenance] Đã dọn dẹp {len(rows)} phiên cũ hơn {days_retention} ngày.")
+        logger.info(f"🧹 [Database Maintenance] Đã dọn dẹp {len(rows)} phiên cũ hơn {days_retention} ngày.")
     except Exception as e:
-        print(f"⚠️ [Database Maintenance Error]: {e}")
+        logger.error(f"⚠️ [Database Maintenance Error]: {e}", exc_info=True)
 
 
 def close_db_connection():
@@ -98,9 +110,9 @@ def close_db_connection():
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             conn.close()
-            print("🔒 [Database] Đã flush WAL và đóng kết nối SQLite an toàn.")
+            logger.info("🔒 [Database] Đã flush WAL và đóng kết nối SQLite an toàn.")
         except Exception as e:
-            print(f"⚠️ [Database Close Error]: {e}")
+            logger.error(f"⚠️ [Database Close Error]: {e}", exc_info=True)
 
 
 # 4. GRAPH INSTANCE
@@ -152,7 +164,7 @@ def start_agent_session(
         return res
 
     except Exception as e:
-        print(f"❌ [Fatal Runtime Error in Session {thread_id}]: {str(e)}")
+        logger.error(f"❌ [Fatal Runtime Error in Session {thread_id}]: {str(e)}", exc_info=True)
         if auto_cleanup:
             delete_thread_data(thread_id)
         else:
@@ -209,7 +221,7 @@ def resume_agent_session(
         return res
 
     except Exception as e:
-        print(f"❌ [Fatal Runtime Error in Session {thread_id}]: {str(e)}")
+        logger.error(f"❌ [Fatal Runtime Error in Session {thread_id}]: {str(e)}", exc_info=True)
         if auto_cleanup:
             delete_thread_data(thread_id)
         else:
@@ -224,24 +236,21 @@ def resume_agent_session(
 
 
 if __name__ == "__main__":
-    if not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "your_openai_api_key_here":
-        print("⚠️ OPENAI_API_KEY chưa được cấu hình. Vui lòng thêm key vào file .env.")
-    else:
-        SESSION_ID = "session_local_persist_002"
+    SESSION_ID = "session_local_persist_002"
 
-        prompt_thieu = "Sửa giúp tôi hàm calculate_average bị crash khi tính toán."
-        print("=== TEST START SESSION ===")
-        res1 = start_agent_session(thread_id=SESSION_ID, user_input=prompt_thieu, auto_cleanup=False)
-        print("Response Status:", res1["is_completed"], "| Interrupt Data:", res1.get("interrupt_data"))
+    prompt_thieu = "Sửa giúp tôi hàm calculate_average bị crash khi tính toán."
+    print("=== TEST START SESSION ===")
+    res1 = start_agent_session(thread_id=SESSION_ID, user_input=prompt_thieu, auto_cleanup=False)
+    print("Response Status:", res1["is_completed"], "| Interrupt Data:", res1.get("interrupt_data"))
 
-        if not res1["is_completed"]:
-            structured_reply = {
-                "error_log": "ZeroDivisionError: division by zero",
-                "source_code": "def calculate_average(nums):\n    return sum(nums) / len(nums)"
-            }
-            print("\n=== TEST RESUME SESSION (Auto Cleanup = True) ===")
-            res2 = resume_agent_session(thread_id=SESSION_ID, user_answer=structured_reply, auto_cleanup=True)
-            print("Final Status Payload:", res2["final_status"])
+    if not res1["is_completed"]:
+        structured_reply = {
+            "error_log": "ZeroDivisionError: division by zero",
+            "source_code": "def calculate_average(nums):\n    return sum(nums) / len(nums)"
+        }
+        print("\n=== TEST RESUME SESSION (Auto Cleanup = True) ===")
+        res2 = resume_agent_session(thread_id=SESSION_ID, user_answer=structured_reply, auto_cleanup=True)
+        print("Final Status Payload:", res2["final_status"])
 
-        # Đóng DB an toàn
-        close_db_connection()
+    # Đóng DB an toàn
+    close_db_connection()

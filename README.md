@@ -36,7 +36,13 @@ ai_engineer_agent/
    pip install -r requirements.txt
    ```
 
-2. **Cấu hình biến môi trường (`.env`):**
+2. **Chuẩn bị trước Docker Images (chạy offline/local execution):**
+   ```bash
+   docker pull python:3.11-slim
+   docker pull node:20-slim
+   ```
+
+3. **Cấu hình biến môi trường (`.env`):**
    Tạo hoặc chỉnh sửa file `.env`:
    ```env
    OPENAI_API_KEY=your_openai_api_key_here

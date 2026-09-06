@@ -23,7 +23,7 @@ class SandboxResult(BaseModel):
 
 
 class FileChange(BaseModel):
-    filename: str = Field(description="Tên file mã nguồn (bao gồm đường dẫn tương đối).")
+    filename: str = Field(min_length=1, description="Tên file mã nguồn (bao gồm đường dẫn tương đối).")
     content: str = Field(description="Nội dung mã nguồn hoàn chỉnh.")
 
 
