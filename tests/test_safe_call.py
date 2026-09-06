@@ -95,8 +95,10 @@ class TestSafeLlmCallRetry:
             {"raw": None, "parsed": None, "parsing_error": "bad"},
         ])
 
-        # RuntimeError message contains both the node name and "unknown_node" default
-        # (it interpolates node_name into the message), so we just match the node name.
+        # safe_llm_call() mặc định node_name="unknown_node" nếu không truyền, nhưng ở đây
+        # ta truyền tường minh node_name="node_1_router" nên message lỗi chắc chắn chứa
+        # đúng chuỗi này. Bỏ nhánh "unknown_node" vì nó không bao giờ xuất hiện ở test này,
+        # và giữ nó chỉ khiến test bỏ lọt trường hợp interpolation bị hỏng.
         with pytest.raises(RuntimeError, match="node_1_router"):
             safe_llm_call(client, DummySchema, "prompt", max_retries=3, node_name="node_1_router")
 
