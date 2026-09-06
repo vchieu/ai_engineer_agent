@@ -1,0 +1,26 @@
+# Environment variables
+.env
+
+# SQLite Checkpointer Databases & WAL sidecar files
+agent_sessions.db*
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
