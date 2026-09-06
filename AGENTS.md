@@ -50,7 +50,7 @@ ai_engineer_agent/
 - Mọi dữ liệu luân chuyển giữa các node, Frontend, và LLM Prompts đều tuân thủ duy nhất chuẩn Pydantic trong [`schemas/payload.py`](schemas/payload.py).
 - Key Models:
   - [`AgentState`](schemas/payload.py:114): State chính chứa lịch sử, tokens, status, input, plan, diagnosis, proposal, sandbox_result, audit_result.
-  - [`CodeFixProposal`](schemas/payload.py:70): Đảm bảo `entrypoint_filename` thuộc danh sách files và khớp với phần mở rộng của `language`.
+  - [`CodeFixProposal`](schemas/payload.py:70): Đảm bảo `entrypoint_filename` thuộc danh sách files, khớp với phần mở rộng của `language`, và ngăn chặn danh sách file bị trùng lặp (duplicate filenames).
   - [`VerifierAudit`](schemas/payload.py:105): Đánh giá độ tin cậy và phản hồi của Verifier Agent.
 
 ### 2. LLM Communication Layer (`llm/safe_call.py`)
@@ -65,8 +65,40 @@ ai_engineer_agent/
   - Tách biệt môi trường & Network: `network_disabled=True`, `tmpfs={'/tmp': 'rw,size=32m,noexec'}`.
   - Phân quyền & Bảo mật nâng cao: `user="1000:1000"`, `cap_drop=["ALL"]`, `security_opt=["no-new-privileges:true"]`, `read_only=True` (chỉ cho phép ghi vào thư mục `/app` được mount tạm và `/tmp` của tmpfs).
   - Ngăn chặn Path Traversal và Safe Tên File: Mọi đường dẫn/file name của Proposal được xác thực thông qua `_is_safe_filename` trong `schemas/payload.py` và gộp đường dẫn cô lập an toàn bằng `_safe_join` trong `sandbox/docker_runner.py`.
+  - Xử lý Timeout & Race Condition: Bọc `container.kill()` và `container.remove(force=True)` trong `try/except` an toàn nhằm chống lại race conditions (409 Conflict/Already exited hoặc 404 Not Found) khi container vừa kết thúc đúng lúc timeout.
 
 ### 4. Graph Architecture (`agent/graph.py` & `agent/nodes.py`)
+- **Workflow Flowchart (Mermaid)**:
+```mermaid
+flowchart TD
+    Start([START: User Prompt]) --> Router[node_1_router: Router Agent]
+
+    Router -->|Intent: MISSING_INFO| CheckRetry{Retries >= Max?}
+    CheckRetry -->|Yes| TerminalMissing[node_terminal_missing_info] --> EndFailMissing([END: FAILED_MISSING_INFO])
+    CheckRetry -->|No| Interrupt[node_missing_info_interrupt: LangGraph Interrupt]
+    Interrupt -.->|Chờ User bổ sung thông tin| Resume([User Resume Input]) -.-> Router
+
+    Router -->|Intent: FIX_BUG| Cleaner[node_2b_cleaner: Clean Stacktrace & Logs]
+    Cleaner --> Diagnosis[node_3b_diagnosis: Diagnosis Agent]
+    Diagnosis --> Coder[node_4_coder: Coder Agent]
+
+    Router -->|Intent: NEW_FEATURE| Planner[node_2a_planner: Planning Agent]
+    Planner --> Coder
+
+    Coder --> Verifier[node_5_verifier: Sandbox Execution & Audit]
+    
+    subgraph Sandbox [Docker Sandbox Container]
+        DockerRun[execute_in_docker_sandbox]
+        DockerRun --> Limits[512MB RAM, 1 CPU, Read-Only, No-Net, Timeout=30s]
+    end
+    Verifier <--> Sandbox
+
+    Verifier --> CheckVerifier{Audit Passed OR Iteration >= Max?}
+    CheckVerifier -->|Passed| EndSuccess([END: SUCCESS])
+    CheckVerifier -->|Max Iterations| EndFailIter([END: FAILED_MAX_ITERATION])
+    CheckVerifier -->|Audit Failed & Iteration < Max| Feedback[Lưu lịch sử & phản hồi lỗi] --> Coder
+```
+
 - **Node Routing Flow**:
   1. `node_1_router`: Phân loại Intent (`MISSING_INFO`, `FIX_BUG`, `NEW_FEATURE`).
   2. Rẽ nhánh theo `route_after_router()`:
@@ -80,6 +112,8 @@ ai_engineer_agent/
 
 ### 5. API Services & Persistence (`main.py`)
 - Khởi tạo SQLite Checkpointer ở chế độ **WAL Mode** (`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`).
+- Cơ chế **Thread-Safe** đồng thời an toàn về dữ liệu: Dùng `threading.RLock()` (`db_lock`, reentrant) bao quanh `graph.stream` và `graph.get_state` để đồng bộ hóa truy cập checkpoint DB. **Kiến trúc Trade-off**: `SqliteSaver` (sync, dùng chung 1 connection) được thiết kế cho single-writer. Với `db_lock` bọc ngoài `graph.stream()`, mỗi session chạy **tuần tự** — tại một thời điểm chỉ 1 session thực thi LLM + Docker, các request khác xếp hàng chờ. Đây là đánh đổi an toàn-tuyệt-đối cho concurrency. Nếu cần throughput cao hơn (nhiều user thật), xem xét: (1) `AsyncSqliteSaver` + FastAPI async endpoints, (2) mỗi thread/request một connection SQLite riêng (WAL + OS file-lock đã hỗ trợ), hoặc (3) `langgraph-checkpoint-postgres`.
+- **Lazy Initialization (Kiểm tra API Key)**: Chuyển kiểm tra `OPENAI_API_KEY` và khởi tạo graph vào hàm getter (`get_llm_clients()`, `get_verifier_graph()`) thay vì chặn ở top-level module, cho phép import module để unit test mà không bị gián đoạn.
 - Expose các hàm API wrapper chuẩn:
   - [`start_agent_session(thread_id, user_input, auto_cleanup=False)`](main.py:123)
   - [`resume_agent_session(thread_id, user_answer, auto_cleanup=False)`](main.py:181)
@@ -92,7 +126,7 @@ ai_engineer_agent/
 
 ---
 
-## Development & Maintenance Rules
+## Development & Maintenance Rules(IMPORTANT)
 
 1. **Modular Consistency**: Khi thêm node mới, đặt handler vào `agent/nodes.py`, khai báo route/edges trong `agent/graph.py`, và re-export tại `agent/__init__.py`.
 2. **Data Model Updates**: Cập nhật `schemas/payload.py` khi thay đổi dữ liệu state hoặc giao tiếp với LLM.

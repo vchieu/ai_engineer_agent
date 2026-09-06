@@ -103,7 +103,10 @@ def execute_in_docker_sandbox(
                     error_message=None if returncode == 0 else f"Exited with code {returncode}"
                 )
             except Exception as e:
-                container.kill()
+                try:
+                    container.kill()
+                except Exception:
+                    pass
                 return SandboxResult(
                     success=False,
                     returncode=-1,
@@ -112,7 +115,10 @@ def execute_in_docker_sandbox(
                     error_message=f"Execution Timeout ({timeout_seconds}s) or Exception: {str(e)}"
                 )
             finally:
-                container.remove(force=True)
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
 
         except Exception as e:
             return SandboxResult(

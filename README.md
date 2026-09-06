@@ -2,6 +2,40 @@
 
 Hệ thống AI Engineering Agent nâng cấp mô-đun hóa, hỗ trợ lập trình tự động, chẩn đoán bug, thực thi sandbox Docker và quản lý session với LangGraph persistent checkpointer.
 
+## 📊 Kiến Trúc & Luồng Xử Lý (Workflow Diagram)
+
+Sơ đồ tuần tự xử lý yêu cầu của Agent thông qua các node và sandbox an toàn:
+
+```mermaid
+flowchart TD
+    Start([START: User Prompt]) --> Router[node_1_router: Router Agent]
+
+    Router -->|Intent: MISSING_INFO| CheckRetry{Retries >= Max?}
+    CheckRetry -->|Yes| TerminalMissing[node_terminal_missing_info] --> EndFailMissing([END: FAILED_MISSING_INFO])
+    CheckRetry -->|No| Interrupt[node_missing_info_interrupt: LangGraph Interrupt]
+    Interrupt -.->|Chờ User bổ sung thông tin| Resume([User Resume Input]) -.-> Router
+
+    Router -->|Intent: FIX_BUG| Cleaner[node_2b_cleaner: Clean Stacktrace & Logs]
+    Cleaner --> Diagnosis[node_3b_diagnosis: Diagnosis Agent]
+    Diagnosis --> Coder[node_4_coder: Coder Agent]
+
+    Router -->|Intent: NEW_FEATURE| Planner[node_2a_planner: Planning Agent]
+    Planner --> Coder
+
+    Coder --> Verifier[node_5_verifier: Sandbox Execution & Audit]
+    
+    subgraph Sandbox [Docker Sandbox Container]
+        DockerRun[execute_in_docker_sandbox]
+        DockerRun --> Limits[Resource Limits: 512MB RAM, 1 CPU, Read-Only, No-Net, Timeout=30s]
+    end
+    Verifier <--> Sandbox
+
+    Verifier --> CheckVerifier{Audit Passed OR Iteration >= Max?}
+    CheckVerifier -->|Audit Passed| EndSuccess([END: SUCCESS])
+    CheckVerifier -->|Max Iterations| EndFailIter([END: FAILED_MAX_ITERATION])
+    CheckVerifier -->|Audit Failed & Iteration < Max| Feedback[Lưu lịch sử & phản hồi lỗi] --> Coder
+```
+
 ## 📁 Cấu Trúc Thư Mục
 
 ```text
@@ -56,9 +90,15 @@ Chạy trực tiếp module chính:
 python main.py
 ```
 
-## 🧹 Database Maintenance & WAL Management
+## 🧹 Database Maintenance & Thread Safety (FastAPI)
 
-Hệ thống sử dụng SQLite Checkpointer ở chế độ **WAL Mode** để hỗ trợ đọc-ghi đồng thời. Tuy nhiên, khi chạy local lâu dài, file `.db` và các file sidecar WAL (`-wal`, `-shm`) có thể phình to. Các hàm quản lý vòng đời database được cung cấp trong `main.py`:
+Hệ thống sử dụng SQLite Checkpointer ở chế độ **WAL Mode** kết hợp cùng `threading.RLock()` (`db_lock`) để đồng bộ hóa truy cập checkpoint DB giữa các thread.
+
+> ⚠️ **Kiến trúc Trade-off**: `SqliteSaver` (sync, dùng chung 1 connection) được thiết kế cho single-writer. Với `db_lock` bao quanh `graph.stream()`, mỗi session chạy **tuần tự** — tại một thời điểm chỉ 1 session thực thi LLM + Docker, các request khác xếp hàng chờ. Đây là đánh đổi an toàn-tuyệt-đối cho concurrency. Nếu cần throughput cao hơn (nhiều user thật), xem xét: (1) `AsyncSqliteSaver` + FastAPI async endpoints, (2) mỗi thread/request một connection SQLite riêng (WAL + OS file-lock đã hỗ trợ), hoặc (3) `langgraph-checkpoint-postgres`.
+
+Đồng thời, module `main.py` hỗ trợ **Lazy Initialization** cho LLM và Graph, cho phép import module để unit test mà không bị gián đoạn nếu biến môi trường `OPENAI_API_KEY` chưa được khởi tạo.
+
+Các hàm quản lý vòng đời database được cung cấp trong `main.py`:
 
 ### 1. Xóa checkpoint của 1 thread cụ thể
 ```python

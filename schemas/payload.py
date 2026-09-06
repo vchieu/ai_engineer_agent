@@ -76,6 +76,10 @@ class CodeFixProposal(BaseModel):
 
     @model_validator(mode="after")
     def validate_proposal(self) -> "CodeFixProposal":
+        filenames = [f.filename for f in self.files]
+        if len(filenames) != len(set(filenames)):
+            raise ValueError("Validation Error: Danh sách file thay đổi chứa các đường dẫn bị trùng lặp (duplicate filenames).")
+
         created_filenames = set()
 
         for f in self.files:
