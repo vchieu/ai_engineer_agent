@@ -1,0 +1,21 @@
+# Cài đặt 1 lần:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Sau đó MỌI lần `git commit` (kể cả commit do AI agent/Claude Code tạo ra
+# qua git CLI) sẽ tự động chạy bộ test nhanh trước. Nếu test đỏ, commit bị
+# chặn cho đến khi sửa xong.
+#
+# Lưu ý: hook này CHỈ chạy test không cần Docker (-m "not integration") để
+# giữ commit nhanh. Chạy `pytest -m integration` thủ công trước khi merge
+# các thay đổi động chạm tới sandbox/docker_runner.py.
+
+repos:
+  - repo: local
+    hooks:
+      - id: pytest-fast
+        name: Chạy unit test nhanh (pytest, bỏ qua integration)
+        entry: pytest -m "not integration" -q
+        language: system
+        pass_filenames: false
+        always_run: true

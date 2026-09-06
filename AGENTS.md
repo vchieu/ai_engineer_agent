@@ -126,6 +126,45 @@ flowchart TD
 
 ---
 
+## 6. Testing & Verification Rules (BẮT BUỘC)
+
+- **Trước khi báo cáo bất kỳ thay đổi code nào là "đã hoàn tất"**, PHẢI chạy:
+  ```bash
+  pytest -m "not integration" -q
+  ```
+  Nếu có test fail, PHẢI sửa cho tới khi pass — không được coi task là xong
+  khi còn test đỏ, và không được xóa/sửa test chỉ để làm nó pass mà không
+  sửa nguyên nhân gốc.
+
+- **Nếu thay đổi động chạm tới `sandbox/docker_runner.py`** hoặc bất kỳ logic
+  thực thi Docker nào (resource limits, timeout, network, filesystem
+  permissions), PHẢI chạy thêm (yêu cầu Docker daemon đang chạy):
+  ```bash
+  pytest -m integration -q
+  ```
+
+- **Khi thêm node mới, sửa schema, hoặc đổi routing logic**: phải viết kèm
+  unit test tương ứng trong `tests/` theo đúng cấu trúc hiện có
+  (`test_payload.py`, `test_graph_routing.py`, `test_nodes.py`, ...).
+  Không merge/hoàn tất logic mới mà thiếu test cho nó.
+
+- **Không mock/patch để né việc gọi LLM hoặc Docker thật trong test integration**
+  — nhóm `@pytest.mark.integration` tồn tại chính là để xác nhận các rào chắn
+  bảo mật (`network_disabled`, `read_only`, `cap_drop`) có tác dụng thật, không
+  chỉ đúng trên giấy.
+
+- Kiểm tra coverage định kỳ để phát hiện vùng code chưa được test:
+  ```bash
+  pytest --cov=. --cov-report=term-missing -m "not integration"
+  ```
+
+- Cài `pre-commit` một lần để tự động hóa bước đầu (`pip install pre-commit
+  && pre-commit install`) — từ đó mọi lệnh `git commit` (kể cả do AI agent
+  chạy qua CLI) sẽ tự chạy `pytest -m "not integration"` trước khi cho phép
+  commit đi qua.
+
+---
+
 ## Development & Maintenance Rules(IMPORTANT)
 
 1. **Modular Consistency**: Khi thêm node mới, đặt handler vào `agent/nodes.py`, khai báo route/edges trong `agent/graph.py`, và re-export tại `agent/__init__.py`.

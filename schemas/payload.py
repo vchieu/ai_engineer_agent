@@ -6,6 +6,9 @@ from pydantic import BaseModel, Field, model_validator
 def _is_safe_filename(filename: str) -> bool:
     if os.path.isabs(filename):
         return False
+    # Trên Windows, os.path.isabs() không nhận Unix-style absolute paths như "/etc/passwd"
+    if filename.startswith("/") and filename.lstrip("/"):
+        return False
     normalized = os.path.normpath(filename)
     parts = normalized.split(os.sep)
     parts_alt = normalized.split("/")
