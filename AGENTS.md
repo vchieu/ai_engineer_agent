@@ -71,44 +71,62 @@ ai_engineer_agent/
 - **Workflow Flowchart (Mermaid)**:
 ```mermaid
 flowchart TD
-    Start([START: User Prompt]) --> Router[node_1_router: Router Agent]
+    Start([START]) --> Router[node_1_router]
 
-    Router -->|Intent: MISSING_INFO| CheckRetry{Retries >= Max?}
-    CheckRetry -->|Yes| TerminalMissing[node_terminal_missing_info] --> EndFailMissing([END: FAILED_MISSING_INFO])
-    CheckRetry -->|No| Interrupt[node_missing_info_interrupt: LangGraph Interrupt]
-    Interrupt -.->|Chờ User bổ sung thông tin| Resume([User Resume Input]) -.-> Router
+    Router -->|MISSING_INFO, chưa hết retry| Interrupt[node_missing_info_interrupt]
+    Router -->|MISSING_INFO, hết retry| TerminalMissing[node_terminal_missing_info] --> EndMissing([END: FAILED_MISSING_INFO])
+    Interrupt -.-> Router
 
-    Router -->|Intent: FIX_BUG| Cleaner[node_2b_cleaner: Clean Stacktrace & Logs]
-    Cleaner --> Diagnosis[node_3b_diagnosis: Diagnosis Agent]
-    Diagnosis --> Coder[node_4_coder: Coder Agent]
+    Router -->|FIX_BUG| Cleaner[node_2b_cleaner] --> Diagnosis[node_3b_diagnosis]
+    Router -->|NEW_FEATURE, TRIVIAL| Coder
+    Router -->|NEW_FEATURE, khác TRIVIAL| Planner[node_2a_planner]
 
-    Router -->|Intent: NEW_FEATURE| Planner[node_2a_planner: Planning Agent]
-    Planner --> Coder
+    Diagnosis --> Dispatch[node_plan_dispatch]
+    Planner --> Dispatch
 
-    Coder --> Verifier[node_5_verifier: Sandbox Execution & Audit]
-    
-    subgraph Sandbox [Docker Sandbox Container]
-        DockerRun[execute_in_docker_sandbox]
-        DockerRun --> Limits[512MB RAM, 1 CPU, Read-Only, No-Net, Timeout=30s]
-    end
-    Verifier <--> Sandbox
+    Dispatch -->|skip_review| Coder[node_4_coder]
+    Dispatch -->|llm_review| PlanReviewer[node_3c_plan_reviewer]
+    Dispatch -->|human_review| PlanInterrupt[node_plan_human_interrupt]
 
-    Verifier --> CheckVerifier{Audit Passed OR Iteration >= Max?}
-    CheckVerifier -->|Passed| EndSuccess([END: SUCCESS])
-    CheckVerifier -->|Max Iterations| EndFailIter([END: FAILED_MAX_ITERATION])
-    CheckVerifier -->|Audit Failed & Iteration < Max| Feedback[Lưu lịch sử & phản hồi lỗi] --> Coder
+    PlanReviewer -->|passed| Coder
+    PlanReviewer -->|failed, còn retry, FIX_BUG| Diagnosis
+    PlanReviewer -->|failed, còn retry, NEW_FEATURE| Planner
+    PlanReviewer -->|hết retry| TerminalPlanRejected[node_terminal_plan_rejected] --> EndPlanRejected([END: FAILED_PLAN_REJECTED])
+
+    PlanInterrupt -.->|approve| Coder
+    PlanInterrupt -.->|reject, FIX_BUG| Diagnosis
+    PlanInterrupt -.->|reject, NEW_FEATURE| Planner
+
+    Coder --> Verifier[node_5_verifier]
+    Verifier -->|passed| EndSuccess([END: SUCCESS])
+    Verifier -->|max iteration| EndMaxIter([END: FAILED_MAX_ITERATION])
+    Verifier -->|fail, còn iteration| Coder
 ```
 
 - **Node Routing Flow**:
-  1. `node_1_router`: Phân loại Intent (`MISSING_INFO`, `FIX_BUG`, `NEW_FEATURE`).
+  1. `node_1_router`: Phân loại Intent (`MISSING_INFO`, `FIX_BUG`, `NEW_FEATURE`) và đánh giá độ phức tạp (`complexity_hint`).
   2. Rẽ nhánh theo `route_after_router()`:
      - `MISSING_INFO` -> `node_missing_info_interrupt` (Pause chờ user bổ sung thông tin qua LangGraph `interrupt`).
-     - `FIX_BUG` -> `node_2b_cleaner` -> `node_3b_diagnosis` -> `node_4_coder`.
-     - `NEW_FEATURE` -> `node_2a_planner` -> `node_4_coder`.
-  3. `node_4_coder` -> `node_5_verifier` (Chạy sandbox + Audit).
-  4. Rẽ nhánh theo `route_after_verifier()`:
+     - `FIX_BUG` -> `node_2b_cleaner` -> `node_3b_diagnosis` -> `node_plan_dispatch`.
+     - `NEW_FEATURE` có `complexity_hint == "TRIVIAL"` -> đi thẳng `node_4_coder`.
+     - `NEW_FEATURE` khác -> `node_2a_planner` -> `node_plan_dispatch`.
+  3. `node_plan_dispatch`: Phân loại chiến lược review (`skip_review`, `llm_review`, `human_review`).
+     - `skip_review` -> `node_4_coder`.
+     - `llm_review` -> `node_3c_plan_reviewer`.
+     - `human_review` -> `node_plan_human_interrupt`.
+  4. `node_3c_plan_reviewer`: Audit kế hoạch, nếu đạt yêu cầu (`passed=True`) -> `node_4_coder`. Nếu thất bại và chưa quá số lần thử -> quay lại `node_2a_planner`/`node_3b_diagnosis`. Nếu quá số lần thử -> `node_terminal_plan_rejected` -> `END`.
+  5. `node_plan_human_interrupt`: Tạm ngắt chờ người dùng phản hồi qua `resume_agent_session`, điều hướng tiếp tùy theo lựa chọn của người dùng.
+  6. `node_4_coder` -> `node_5_verifier` (Chạy sandbox + Audit).
+  7. Rẽ nhánh theo `route_after_verifier()`:
      - Nếu thành công (`SUCCESS`) hoặc vượt quá số vòng tối đa (`FAILED_MAX_ITERATION`) -> `END`.
      - Ngược lại -> Quay lại `node_4_coder` để sửa lỗi.
+
+### 4b. Plan Dispatch & Review System
+
+- `node_plan_dispatch`: node THUẦN PYTHON (không gọi LLM), đọc `plan`/`diagnosis` vừa sinh ra để quyết định `review_strategy` (`skip_review` / `llm_review` / `human_review`) dựa trên: số file bị ảnh hưởng (ngưỡng `PLAN_DISPATCH_FILE_THRESHOLD=3`), từ khóa rủi ro (`RISK_KEYWORDS`), file trọng yếu (`CRITICAL_FILES`), và `complexity_hint` do `node_1_router` đánh giá.
+- `node_3c_plan_reviewer`: dùng schema `PlanAudit`, bắt buộc `identified_risks` không rỗng kể cả khi `passed=True`, với prompt đóng vai "Tech Lead khó tính" để giảm confirmation bias.
+- `node_plan_human_interrupt`: dừng bằng LangGraph `interrupt`, tương tự `node_missing_info_interrupt`, chờ người dùng gửi `{"decision": "approve"}` hoặc `{"decision": "reject", "feedback": "..."}` qua `resume_agent_session`.
+- `NEW_FEATURE` với `complexity_hint=TRIVIAL` bỏ qua toàn bộ `node_2a_planner` lẫn `node_plan_dispatch`, đi thẳng `node_4_coder` — không tốn thêm lệnh gọi LLM nào vì `complexity_hint` đến từ chính `node_1_router` (vốn đã luôn chạy).
 
 ### 5. API Services & Persistence (`main.py`)
 - Khởi tạo SQLite Checkpointer ở chế độ **WAL Mode** (`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`).

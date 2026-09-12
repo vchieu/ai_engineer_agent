@@ -7,11 +7,17 @@ from agent.nodes import (
     node_3b_diagnosis,
     node_4_coder,
     node_5_verifier,
+    node_plan_dispatch,
+    node_3c_plan_reviewer,
+    node_plan_human_interrupt,
+    node_terminal_plan_rejected,
 )
 from agent.graph import (
     create_agent_graph,
     route_after_router,
     route_after_verifier,
+    route_after_plan_dispatch,
+    route_after_plan_review,
     extract_interrupt_data,
 )
 
@@ -24,8 +30,14 @@ __all__ = [
     "node_3b_diagnosis",
     "node_4_coder",
     "node_5_verifier",
+    "node_plan_dispatch",
+    "node_3c_plan_reviewer",
+    "node_plan_human_interrupt",
+    "node_terminal_plan_rejected",
     "create_agent_graph",
     "route_after_router",
     "route_after_verifier",
+    "route_after_plan_dispatch",
+    "route_after_plan_review",
     "extract_interrupt_data",
 ]

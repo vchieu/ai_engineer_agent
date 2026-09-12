@@ -5,10 +5,24 @@ from langgraph.types import interrupt, Command
 
 from schemas.payload import (
     AgentState, RouterDecision, PlanSchema, DiagnosisSchema,
-    CodeFixProposal, VerifierAudit, HistoryEntry
+    CodeFixProposal, VerifierAudit, HistoryEntry, PlanAudit
 )
 from llm.safe_call import safe_llm_call
 from sandbox.docker_runner import execute_in_docker_sandbox
+
+
+# Danh sách file "trọng yếu" — mọi thay đổi đụng tới các file này bắt buộc phải qua
+# con người duyệt, bất kể plan/diagnosis trông đơn giản tới đâu. Cập nhật danh sách
+# này khi dự án có thêm file nhạy cảm mới (ví dụ: thêm module xử lý thanh toán).
+CRITICAL_FILES = {"docker_runner.py", "payload.py", "main.py", "safe_call.py"}
+
+RISK_KEYWORDS = [
+    "password", "mật khẩu", "credential", "secret", "token", "auth",
+    "payment", "thanh toán", "database", "migration", "drop table",
+    "schema", "production", "security", "bảo mật", "admin", "pii",
+]
+
+PLAN_DISPATCH_FILE_THRESHOLD = 3  # >= số file này -> bắt buộc llm_review
 
 
 def _get_model_name(llm_client: Any) -> str:
@@ -40,6 +54,11 @@ Hãy phân tích yêu cầu người dùng và quyết định luồng:
 2. 'FIX_BUG': Sửa bug/lỗi đang xảy ra cùng đoạn code/log lỗi.
 3. 'NEW_FEATURE': Phát triển hoặc viết mới tính năng/module.
 
+Đồng thời đánh giá độ phức tạp (complexity_hint):
+- 'TRIVIAL': Thay đổi rất nhỏ, rủi ro thấp (sửa 1 dòng, đổi text/label, thêm log, đổi hằng số).
+- 'STANDARD': Logic rõ ràng, phạm vi vừa phải.
+- 'COMPLEX': Ảnh hưởng nhiều file, đổi kiến trúc, hoặc đụng khu vực nhạy cảm (auth, database, payment, security).
+
 User Input:
 {state.user_input}
 """
@@ -49,6 +68,7 @@ User Input:
 
     state.intent = decision.intent
     state.missing_fields = decision.missing_fields
+    state.complexity_hint = decision.complexity_hint
     print(f"     Kết quả Router: {decision.intent} | Lý do: {decision.reasoning}")
     return state
 
@@ -90,7 +110,14 @@ def node_terminal_missing_info(state: AgentState) -> AgentState:
 
 def node_2a_planner(state: AgentState, llm_strong: Any) -> AgentState:
     print("\n---> [Node 2A] Planner Agent đang lập kế hoạch...")
-    prompt = f"Bạn là Lead Architect. Hãy lập kế hoạch phát triển tính năng:\n{state.user_input}"
+
+    feedback_note = ""
+    if state.plan_audit_result and not state.plan_audit_result.passed:
+        feedback_note += f"\n\n[Phản hồi từ Plan Reviewer ở vòng trước, cần khắc phục]:\n{state.plan_audit_result.audit_feedback}"
+    if state.plan_review_feedback:
+        feedback_note += f"\n\n[Phản hồi từ người dùng]:\n{state.plan_review_feedback}"
+
+    prompt = f"Bạn là Lead Architect. Hãy lập kế hoạch phát triển tính năng:\n{state.user_input}{feedback_note}"
     model_name = _get_model_name(llm_strong)
     plan, token_stats = safe_llm_call(llm_strong, PlanSchema, prompt, model_name=model_name, node_name="node_2a_planner")
     _update_tokens(state, token_stats)
@@ -111,12 +138,132 @@ def node_2b_cleaner(state: AgentState) -> AgentState:
 
 def node_3b_diagnosis(state: AgentState, llm_strong: Any) -> AgentState:
     print("\n---> [Node 3B] Diagnosis Agent đang chẩn đoán...")
-    prompt = f"Bạn là Senior Debugging Expert. Hãy chẩn đoán nguyên nhân bug:\n{state.cleaned_logs}"
+
+    feedback_note = ""
+    if state.plan_audit_result and not state.plan_audit_result.passed:
+        feedback_note += f"\n\n[Phản hồi từ Plan Reviewer ở vòng trước, cần khắc phục]:\n{state.plan_audit_result.audit_feedback}"
+    if state.plan_review_feedback:
+        feedback_note += f"\n\n[Phản hồi từ người dùng]:\n{state.plan_review_feedback}"
+
+    prompt = f"Bạn là Senior Debugging Expert. Hãy chẩn đoán nguyên nhân bug:\n{state.cleaned_logs}{feedback_note}"
     model_name = _get_model_name(llm_strong)
     diagnosis, token_stats = safe_llm_call(llm_strong, DiagnosisSchema, prompt, model_name=model_name, node_name="node_3b_diagnosis")
     _update_tokens(state, token_stats)
 
     state.diagnosis = diagnosis
+    return state
+
+
+def node_plan_dispatch(state: AgentState) -> AgentState:
+    """
+    Node THUẦN PYTHON, không gọi LLM -> không tốn token, gần như tức thời.
+    Đọc chính Plan/Diagnosis vừa được sinh ra để quyết định có cần review
+    kế hoạch hay không, và review bằng cách nào (LLM hay con người).
+    """
+    print("\n---> [Node Plan Dispatch] Đang phân loại chiến lược review...")
+
+    if state.intent == "NEW_FEATURE" and state.plan:
+        files = state.plan.target_files
+        text = " ".join(state.plan.steps) + " " + state.plan.acceptance_criteria
+    elif state.diagnosis:
+        files = state.diagnosis.affected_files
+        text = state.diagnosis.suggested_approach + " " + state.diagnosis.acceptance_criteria
+    else:
+        files, text = [], ""
+
+    combined_text = (state.user_input + " " + text).lower()
+    risk_hit = any(keyword in combined_text for keyword in RISK_KEYWORDS)
+    touches_critical_file = any(f in CRITICAL_FILES for f in files)
+
+    if state.force_human_review or touches_critical_file:
+        strategy = "human_review"
+    elif risk_hit or state.complexity_hint == "COMPLEX" or len(files) >= PLAN_DISPATCH_FILE_THRESHOLD:
+        strategy = "llm_review"
+    elif state.intent == "NEW_FEATURE" and state.complexity_hint != "TRIVIAL":
+        strategy = "llm_review"
+    else:
+        strategy = "skip_review"
+
+    print(f"     Kết quả Dispatch: {strategy} (files={len(files)}, risk_hit={risk_hit}, "
+          f"complexity={state.complexity_hint}, critical_file={touches_critical_file})")
+
+    state.review_strategy = strategy
+    return state
+
+
+def node_3c_plan_reviewer(state: AgentState, llm_strong: Any) -> AgentState:
+    print(f"\n---> [Node 3C] Plan Reviewer Agent đang audit kế hoạch (Vòng #{state.plan_review_retries + 1})...")
+
+    if state.intent == "NEW_FEATURE" and state.plan:
+        plan_text = (
+            f"Steps: {state.plan.steps}\n"
+            f"Files: {state.plan.target_files}\n"
+            f"Acceptance Criteria: {state.plan.acceptance_criteria}"
+        )
+    elif state.diagnosis:
+        plan_text = (
+            f"Root Cause: {state.diagnosis.root_cause}\n"
+            f"Approach: {state.diagnosis.suggested_approach}\n"
+            f"Files: {state.diagnosis.affected_files}\n"
+            f"Acceptance Criteria: {state.diagnosis.acceptance_criteria}"
+        )
+    else:
+        plan_text = "Không có Plan hoặc Diagnosis nào được tạo trước đó (trạng thái bất thường)."
+
+    prompt = f"""Bạn là một Tech Lead khó tính. Nhiệm vụ DUY NHẤT của bạn là TÌM RA lỗi/rủi ro
+trong kế hoạch dưới đây — KHÔNG PHẢI để xác nhận nó đúng.
+Ngay cả khi bạn quyết định kế hoạch đạt yêu cầu (passed=True), bạn VẪN PHẢI liệt kê ít nhất
+1 rủi ro tiềm ẩn (identified_risks) — không được để trống, không được viết qua loa kiểu "không có rủi ro".
+
+Kế hoạch cần audit:
+{plan_text}
+
+Yêu cầu gốc của người dùng:
+{state.user_input}
+"""
+    model_name = _get_model_name(llm_strong)
+    audit, token_stats = safe_llm_call(
+        llm_strong, PlanAudit, prompt, model_name=model_name, node_name="node_3c_plan_reviewer"
+    )
+    _update_tokens(state, token_stats)
+
+    state.plan_audit_result = audit
+    state.plan_review_retries += 1
+    return state
+
+
+def node_plan_human_interrupt(state: AgentState) -> Command[Literal["node_4_coder", "node_2a_planner", "node_3b_diagnosis"]]:
+    plan_payload = {}
+    if state.intent == "NEW_FEATURE" and state.plan:
+        plan_payload = state.plan.model_dump()
+    elif state.diagnosis:
+        plan_payload = state.diagnosis.model_dump()
+
+    resp = interrupt({
+        "status": "AWAITING_PLAN_APPROVAL",
+        "intent": state.intent,
+        "plan_or_diagnosis": plan_payload,
+    })
+
+    print("\n---> [Interrupt Resumed] Nhận phản hồi duyệt plan từ người dùng...")
+
+    decision = resp.get("decision") if isinstance(resp, dict) else str(resp)
+
+    if decision == "approve":
+        return Command(goto="node_4_coder")
+
+    feedback = (
+        resp.get("feedback", "Người dùng từ chối kế hoạch, cần điều chỉnh lại.")
+        if isinstance(resp, dict) else str(resp)
+    )
+    next_node = "node_2a_planner" if state.intent == "NEW_FEATURE" else "node_3b_diagnosis"
+    return Command(goto=next_node, update={"plan_review_feedback": feedback})
+
+
+def node_terminal_plan_rejected(state: AgentState) -> AgentState:
+    print("\n---> [Terminal] Kế hoạch bị từ chối sau nhiều vòng review.")
+    state.final_status = "FAILED_PLAN_REJECTED"
+    state.error_message = f"Plan Reviewer từ chối kế hoạch sau {state.max_plan_review_retries} lần review liên tiếp."
     return state
 
 

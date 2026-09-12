@@ -55,6 +55,14 @@ class RouterDecision(BaseModel):
         default=None, 
         description="Chi tiết từng thông tin còn thiếu nếu intent là MISSING_INFO"
     )
+    complexity_hint: Literal["TRIVIAL", "STANDARD", "COMPLEX"] = Field(
+        description=(
+            "TRIVIAL: thay đổi rất nhỏ, rủi ro thấp (sửa 1 dòng, đổi text/label, thêm log). "
+            "STANDARD: logic rõ ràng, phạm vi vừa phải. "
+            "COMPLEX: ảnh hưởng nhiều file, đổi kiến trúc, hoặc đụng khu vực nhạy cảm "
+            "(auth, database, payment, security)."
+        )
+    )
 
 
 class PlanSchema(BaseModel):
@@ -115,7 +123,22 @@ class VerifierAudit(BaseModel):
     confidence: float = Field(description="Độ tin cậy của phán quyết (0.0 đến 1.0)")
 
 
-FinalStatusType = Literal["SUCCESS", "FAILED_MAX_ITERATION", "FAILED_MISSING_INFO", "ERROR"]
+class PlanAudit(BaseModel):
+    passed: bool = Field(
+        description="True nếu kế hoạch đủ chi tiết, khả thi, không có rủi ro nghiêm trọng chưa xử lý."
+    )
+    identified_risks: List[str] = Field(
+        min_length=1,
+        description=(
+            "Danh sách rủi ro/điểm yếu tiềm ẩn của kế hoạch. BẮT BUỘC có ít nhất 1 mục, "
+            "kể cả khi passed=True — để chống confirmation bias (LLM có xu hướng tự khen)."
+        ),
+    )
+    audit_feedback: str = Field(description="Nhận xét chi tiết, hướng dẫn khắc phục cụ thể nếu passed=False.")
+    confidence: float = Field(description="Độ tin cậy của phán quyết (0.0 đến 1.0).")
+
+
+FinalStatusType = Literal["SUCCESS", "FAILED_MAX_ITERATION", "FAILED_MISSING_INFO", "FAILED_PLAN_REJECTED", "ERROR"]
 
 
 class AgentState(BaseModel):
@@ -133,6 +156,13 @@ class AgentState(BaseModel):
     max_iteration: int = 3
     missing_info_retries: int = 0
     max_missing_info_retries: int = 3
+    complexity_hint: Optional[Literal["TRIVIAL", "STANDARD", "COMPLEX"]] = None
+    plan_audit_result: Optional[PlanAudit] = None
+    plan_review_retries: int = 0
+    max_plan_review_retries: int = 2
+    plan_review_feedback: Optional[str] = None
+    review_strategy: Optional[Literal["skip_review", "llm_review", "human_review"]] = None
+    force_human_review: bool = False
     
     final_status: Optional[FinalStatusType] = None
     error_message: Optional[str] = None

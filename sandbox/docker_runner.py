@@ -16,7 +16,12 @@ def _get_docker_client() -> docker.DockerClient:
 
 
 def _safe_join(base_dir: str, filename: str) -> str:
-    if os.path.isabs(filename) or ".." in filename.split(os.sep) or ".." in filename.split("/"):
+    if os.path.isabs(filename):
+        raise ValueError(f"Filename không hợp lệ (Path Traversal): {filename}")
+    # Trên Windows, os.path.isabs() không nhận Unix-style absolute paths như "/etc/passwd"
+    if filename.startswith("/") and filename.lstrip("/"):
+        raise ValueError(f"Filename không hợp lệ (Path Traversal): {filename}")
+    if ".." in filename.split(os.sep) or ".." in filename.split("/"):
         raise ValueError(f"Filename không hợp lệ (Path Traversal): {filename}")
     
     full_path = os.path.normpath(os.path.join(base_dir, filename))

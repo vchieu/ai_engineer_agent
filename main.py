@@ -154,14 +154,18 @@ def __getattr__(name: str):
 def start_agent_session(
     thread_id: str,
     user_input: str,
-    auto_cleanup: bool = False
+    auto_cleanup: bool = False,
+    force_human_review: bool = False,
 ) -> Dict[str, Any]:
     """
     Khởi chạy phiên làm việc mới.
     - auto_cleanup=True: Tự động xóa history khỏi DB ngay khi session kết thúc (tránh phình đĩa).
     """
     config = {"configurable": {"thread_id": thread_id}}
-    initial_state = AgentState(user_input=user_input, max_iteration=3, max_missing_info_retries=3)
+    initial_state = AgentState(
+        user_input=user_input, max_iteration=3, max_missing_info_retries=3,
+        force_human_review=force_human_review,
+    )
     graph = get_verifier_graph()
 
     try:

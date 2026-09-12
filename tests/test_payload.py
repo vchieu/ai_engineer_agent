@@ -100,3 +100,17 @@ class TestCodeFixProposalValidation:
                 entrypoint_filename="index.py",
                 files=[FileChange(filename="index.py", content="pass")],
             ))
+
+
+class TestPlanAuditValidation:
+    def test_empty_identified_risks_rejected(self):
+        """Chống confirmation bias: không cho phép để trống risks kể cả khi passed=True."""
+        from pydantic import ValidationError
+        from schemas.payload import PlanAudit
+        with pytest.raises(ValidationError):
+            PlanAudit(passed=True, identified_risks=[], audit_feedback="ok", confidence=0.9)
+
+    def test_non_empty_risks_accepted(self):
+        from schemas.payload import PlanAudit
+        audit = PlanAudit(passed=True, identified_risks=["rủi ro nhỏ về hiệu năng"], audit_feedback="ok", confidence=0.9)
+        assert audit.passed is True

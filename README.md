@@ -8,32 +8,36 @@ Sơ đồ tuần tự xử lý yêu cầu của Agent thông qua các node và s
 
 ```mermaid
 flowchart TD
-    Start([START: User Prompt]) --> Router[node_1_router: Router Agent]
+    Start([START]) --> Router[node_1_router]
 
-    Router -->|Intent: MISSING_INFO| CheckRetry{Retries >= Max?}
-    CheckRetry -->|Yes| TerminalMissing[node_terminal_missing_info] --> EndFailMissing([END: FAILED_MISSING_INFO])
-    CheckRetry -->|No| Interrupt[node_missing_info_interrupt: LangGraph Interrupt]
-    Interrupt -.->|Chờ User bổ sung thông tin| Resume([User Resume Input]) -.-> Router
+    Router -->|MISSING_INFO, chưa hết retry| Interrupt[node_missing_info_interrupt]
+    Router -->|MISSING_INFO, hết retry| TerminalMissing[node_terminal_missing_info] --> EndMissing([END: FAILED_MISSING_INFO])
+    Interrupt -.-> Router
 
-    Router -->|Intent: FIX_BUG| Cleaner[node_2b_cleaner: Clean Stacktrace & Logs]
-    Cleaner --> Diagnosis[node_3b_diagnosis: Diagnosis Agent]
-    Diagnosis --> Coder[node_4_coder: Coder Agent]
+    Router -->|FIX_BUG| Cleaner[node_2b_cleaner] --> Diagnosis[node_3b_diagnosis]
+    Router -->|NEW_FEATURE, TRIVIAL| Coder
+    Router -->|NEW_FEATURE, khác TRIVIAL| Planner[node_2a_planner]
 
-    Router -->|Intent: NEW_FEATURE| Planner[node_2a_planner: Planning Agent]
-    Planner --> Coder
+    Diagnosis --> Dispatch[node_plan_dispatch]
+    Planner --> Dispatch
 
-    Coder --> Verifier[node_5_verifier: Sandbox Execution & Audit]
-    
-    subgraph Sandbox [Docker Sandbox Container]
-        DockerRun[execute_in_docker_sandbox]
-        DockerRun --> Limits[Resource Limits: 512MB RAM, 1 CPU, Read-Only, No-Net, Timeout=30s]
-    end
-    Verifier <--> Sandbox
+    Dispatch -->|skip_review| Coder[node_4_coder]
+    Dispatch -->|llm_review| PlanReviewer[node_3c_plan_reviewer]
+    Dispatch -->|human_review| PlanInterrupt[node_plan_human_interrupt]
 
-    Verifier --> CheckVerifier{Audit Passed OR Iteration >= Max?}
-    CheckVerifier -->|Audit Passed| EndSuccess([END: SUCCESS])
-    CheckVerifier -->|Max Iterations| EndFailIter([END: FAILED_MAX_ITERATION])
-    CheckVerifier -->|Audit Failed & Iteration < Max| Feedback[Lưu lịch sử & phản hồi lỗi] --> Coder
+    PlanReviewer -->|passed| Coder
+    PlanReviewer -->|failed, còn retry, FIX_BUG| Diagnosis
+    PlanReviewer -->|failed, còn retry, NEW_FEATURE| Planner
+    PlanReviewer -->|hết retry| TerminalPlanRejected[node_terminal_plan_rejected] --> EndPlanRejected([END: FAILED_PLAN_REJECTED])
+
+    PlanInterrupt -.->|approve| Coder
+    PlanInterrupt -.->|reject, FIX_BUG| Diagnosis
+    PlanInterrupt -.->|reject, NEW_FEATURE| Planner
+
+    Coder --> Verifier[node_5_verifier]
+    Verifier -->|passed| EndSuccess([END: SUCCESS])
+    Verifier -->|max iteration| EndMaxIter([END: FAILED_MAX_ITERATION])
+    Verifier -->|fail, còn iteration| Coder
 ```
 
 ## 📁 Cấu Trúc Thư Mục
