@@ -27,6 +27,10 @@ class TestSafeJoin:
         "/etc/passwd",
         "../escape.py",
         "sub/../../escape.py",
+        "C:boot.ini",
+        "\\\\server\\share\\file.py",
+        ".",
+        "",
     ])
     def test_path_traversal_rejected(self, tmp_path, filename):
         with pytest.raises(ValueError):

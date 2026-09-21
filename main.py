@@ -23,6 +23,12 @@ logger = logging.getLogger("ai_engineer_agent")
 db_lock = threading.RLock()
 _graph_lock = threading.Lock()
 _verifier_graph = None
+# Cờ đánh dấu close_db_connection() đã chạy: checkpointer giữ tham chiếu tới
+# connection object GỐC (không phải biến `conn` toàn cục), nên set `conn = None`
+# không khiến checkpointer "quên" connection cũ — nó vẫn cầm 1 connection đã bị
+# .close(), và lần gọi tiếp theo sẽ ném lỗi sqlite3 khó hiểu. Cờ này giúp báo lỗi
+# rõ ràng ngay từ đầu thay vì để traceback nội bộ SQLite lộ ra ngoài.
+_db_closed = False
 
 
 # 1. KHỞI TẠO VÀ KIỂM TRA MÔI TRƯỜNG (LAZY LOADING CHO UNIT TESTS)
@@ -36,8 +42,12 @@ def get_llm_clients():
             "❌ OPENAI_API_KEY không hợp lệ hoặc chưa được cấu hình đúng trong file .env."
         )
 
-    llm_strong = ChatOpenAI(model="gpt-4o", temperature=0.0, api_key=api_key)
-    llm_cheap = ChatOpenAI(model="gpt-4o-mini", temperature=0.0, api_key=api_key)
+    # Cho phép override model qua .env thay vì hardcode — cần thiết khi muốn thử
+    # model khác (vd gpt-4.1, gpt-4o-2024-...) mà không phải sửa code.
+    strong_model = os.getenv("LLM_STRONG_MODEL", "gpt-4o")
+    cheap_model = os.getenv("LLM_CHEAP_MODEL", "gpt-4o-mini")
+    llm_strong = ChatOpenAI(model=strong_model, temperature=0.0, api_key=api_key)
+    llm_cheap = ChatOpenAI(model=cheap_model, temperature=0.0, api_key=api_key)
     return llm_strong, llm_cheap
 
 
@@ -57,28 +67,38 @@ assert hasattr(checkpointer, "delete_thread"), (
     "vui lòng nâng cấp package trước khi chạy (ví dụ: pip install -U 'langgraph-checkpoint>=2.0.25')."
 )
 
-# Tự quản lý thời gian hoàn tất session để dọn dẹp an toàn
+# Tự quản lý HOẠT ĐỘNG GẦN NHẤT của mỗi thread (không chỉ lúc "hoàn tất") để
+# phục vụ cronjob dọn dẹp an toàn.
+# LƯU Ý FIX: bảng cũ tên "session_completions" chỉ được ghi khi session HOÀN TẤT
+# (is_completed=True) — 1 session dừng ở interrupt (chờ người dùng bổ sung info /
+# duyệt plan) và KHÔNG BAO GIỜ quay lại resume sẽ không bao giờ xuất hiện trong
+# bảng này, nên cleanup_old_sessions() không bao giờ dọn được nó -> checkpoint DB
+# phình vô hạn cho các session bị người dùng bỏ dở. Đổi sang track "last_activity"
+# ghi ở MỌI lần gọi start/resume (bất kể kết quả completed hay interrupted).
 with db_lock:
     with conn:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS session_completions (
+            CREATE TABLE IF NOT EXISTS session_activity (
                 thread_id TEXT PRIMARY KEY,
-                completed_at TEXT NOT NULL
+                last_activity_at TEXT NOT NULL
             )
         """)
 
 
-def _mark_session_completed(thread_id: str):
-    """Lưu vết thời điểm session kết thúc để phục vụ cronjob dọn dẹp (Thread-safe)."""
+def _touch_session_activity(thread_id: str):
+    """Cập nhật thời điểm hoạt động gần nhất của thread (Thread-safe). Gọi ở MỌI
+    lần start/resume, kể cả khi session dừng lại ở interrupt hoặc lỗi — để
+    cleanup_old_sessions() có thể dọn được cả các session bị bỏ dở, không chỉ
+    session đã hoàn tất."""
     try:
         with db_lock:
             with conn:
                 conn.execute(
-                    "INSERT OR REPLACE INTO session_completions (thread_id, completed_at) VALUES (?, datetime('now'))",
+                    "INSERT OR REPLACE INTO session_activity (thread_id, last_activity_at) VALUES (?, datetime('now'))",
                     (thread_id,)
                 )
     except Exception as e:
-        logger.error(f"[Tracking Error] Không thể đánh dấu hoàn tất cho thread {thread_id}: {e}", exc_info=True)
+        logger.error(f"[Tracking Error] Không thể ghi nhận hoạt động cho thread {thread_id}: {e}", exc_info=True)
 
 
 # 3. QUẢN LÝ DỌN DẸP & VÒNG ĐỜI DATABASE
@@ -88,7 +108,7 @@ def delete_thread_data(thread_id: str):
         with db_lock:
             checkpointer.delete_thread(thread_id)
             with conn:
-                conn.execute("DELETE FROM session_completions WHERE thread_id = ?", (thread_id,))
+                conn.execute("DELETE FROM session_activity WHERE thread_id = ?", (thread_id,))
 
         logger.info(f"🧹 [Database Cleanup] Đã xóa toàn bộ dữ liệu của thread: {thread_id}")
     except Exception as e:
@@ -96,19 +116,22 @@ def delete_thread_data(thread_id: str):
 
 
 def cleanup_old_sessions(days_retention: int = 7):
-    """Dọn dẹp các checkpoint cũ dựa trên bảng tracking độc lập (Thread-safe)."""
+    """Dọn dẹp các checkpoint cũ dựa trên `last_activity_at` (Thread-safe).
+    Áp dụng cho MỌI thread không hoạt động quá `days_retention` ngày, kể cả các
+    session đang dừng ở interrupt (chờ user) mà không bao giờ được resume —
+    được coi là bị bỏ dở và dọn như session đã hoàn tất."""
     try:
         with db_lock:
             with conn:
                 rows = conn.execute(
-                    "SELECT thread_id FROM session_completions WHERE completed_at < datetime('now', '-' || ? || ' days')",
+                    "SELECT thread_id FROM session_activity WHERE last_activity_at < datetime('now', '-' || ? || ' days')",
                     (days_retention,)
                 ).fetchall()
 
             for (tid,) in rows:
                 checkpointer.delete_thread(tid)
                 with conn:
-                    conn.execute("DELETE FROM session_completions WHERE thread_id = ?", (tid,))
+                    conn.execute("DELETE FROM session_activity WHERE thread_id = ?", (tid,))
 
             with conn:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -120,13 +143,14 @@ def cleanup_old_sessions(days_retention: int = 7):
 
 def close_db_connection():
     """Flush WAL vĩnh viễn vào file chính và đóng connection (dùng khi shutdown app/FastAPI)."""
-    global conn
+    global conn, _db_closed
     if conn:
         try:
             with db_lock:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 conn.close()
                 conn = None
+                _db_closed = True
             logger.info("🔒 [Database] Đã flush WAL và đóng kết nối SQLite an toàn.")
         except Exception as e:
             logger.error(f"⚠️ [Database Close Error]: {e}", exc_info=True)
@@ -136,6 +160,11 @@ def close_db_connection():
 def get_verifier_graph():
     """Khởi tạo verifier_graph dạng singleton (thread-safe)."""
     global _verifier_graph
+    if _db_closed:
+        raise RuntimeError(
+            "❌ close_db_connection() đã được gọi — checkpointer đang giữ 1 connection SQLite "
+            "đã đóng, không thể mở session mới. Cần khởi động lại process để tạo connection mới."
+        )
     if _verifier_graph is None:
         with _graph_lock:
             if _verifier_graph is None:
@@ -161,12 +190,19 @@ def start_agent_session(
     Khởi chạy phiên làm việc mới.
     - auto_cleanup=True: Tự động xóa history khỏi DB ngay khi session kết thúc (tránh phình đĩa).
     """
-    config = {"configurable": {"thread_id": thread_id}}
+    # recursion_limit mặc định của LangGraph (25) có thể chạm giới hạn khi có
+    # nhiều vòng human/llm review + iteration coder/verifier cộng dồn trong 1
+    # session — nới ra và cho phép cấu hình qua env thay vì hardcode ngầm.
+    recursion_limit = int(os.getenv("GRAPH_RECURSION_LIMIT", "50"))
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
     initial_state = AgentState(
         user_input=user_input, max_iteration=3, max_missing_info_retries=3,
         force_human_review=force_human_review,
     )
     graph = get_verifier_graph()
+    # Ghi nhận hoạt động NGAY LẬP TỨC, trước khi biết kết quả completed/interrupted/
+    # error — xem giải thích ở định nghĩa _touch_session_activity().
+    _touch_session_activity(thread_id)
 
     try:
         # TRADE-OFF: Khóa bao gồm toàn bộ graph.stream() (LLM calls + Docker sandbox),
@@ -201,7 +237,7 @@ def start_agent_session(
             delete_thread_data(thread_id)
         else:
             # Ghi nhận thời gian để hàm cleanup_old_sessions() dọn dẹp sau này
-            _mark_session_completed(thread_id)
+            _touch_session_activity(thread_id)
 
         return res
 
@@ -210,7 +246,7 @@ def start_agent_session(
         if auto_cleanup:
             delete_thread_data(thread_id)
         else:
-            _mark_session_completed(thread_id)
+            _touch_session_activity(thread_id)
         return {
             "thread_id": thread_id,
             "is_completed": True,
@@ -229,8 +265,14 @@ def resume_agent_session(
     Tiếp tục phiên bị tạm ngắt.
     - auto_cleanup=True: Tự động xóa history khỏi DB ngay khi session kết thúc.
     """
-    config = {"configurable": {"thread_id": thread_id}}
+    recursion_limit = int(os.getenv("GRAPH_RECURSION_LIMIT", "50"))
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
     graph = get_verifier_graph()
+    # Ghi nhận hoạt động ngay khi resume được gọi — quan trọng cho các session
+    # trước đó dừng ở interrupt: nếu user resume rồi lại bị interrupt tiếp (vd
+    # human_review nhiều vòng), mỗi lần resume phải "touch" lại để không bị
+    # cleanup_old_sessions() dọn nhầm 1 session vẫn đang hoạt động dở dang.
+    _touch_session_activity(thread_id)
 
     try:
         # TRADE-OFF: Khóa bao gồm toàn bộ graph.stream() (LLM calls + Docker sandbox),
@@ -265,7 +307,7 @@ def resume_agent_session(
             delete_thread_data(thread_id)
         else:
             # Ghi nhận thời gian để hàm cleanup_old_sessions() dọn dẹp sau này
-            _mark_session_completed(thread_id)
+            _touch_session_activity(thread_id)
 
         return res
 
@@ -274,7 +316,7 @@ def resume_agent_session(
         if auto_cleanup:
             delete_thread_data(thread_id)
         else:
-            _mark_session_completed(thread_id)
+            _touch_session_activity(thread_id)
         return {
             "thread_id": thread_id,
             "is_completed": True,

@@ -2,6 +2,12 @@
 
 Hệ thống AI Engineering Agent nâng cấp mô-đun hóa, hỗ trợ lập trình tự động, chẩn đoán bug, thực thi sandbox Docker và quản lý session với LangGraph persistent checkpointer.
 
+> ℹ️ **Lưu ý**: "API" ở đây là các hàm Python (`start_agent_session`, `resume_agent_session`,...)
+> trong `main.py`, KHÔNG phải một REST/HTTP server đang chạy sẵn. Dự án hiện chưa có tầng
+> FastAPI/web server — các hàm này được thiết kế để dễ dàng wrap bởi FastAPI/Flask sau này,
+> nhưng tại thời điểm này bạn cần `import` và gọi trực tiếp trong Python (xem `main.py`
+> phần `if __name__ == "__main__":` để biết cách gọi).
+
 ## 📊 Kiến Trúc & Luồng Xử Lý (Workflow Diagram)
 
 Sơ đồ tuần tự xử lý yêu cầu của Agent thông qua các node và sandbox an toàn:
@@ -57,7 +63,7 @@ ai_engineer_agent/
 │   ├── __init__.py
 │   ├── nodes.py            # Các logic xử lý chính (Router, Planner, Coder, Verifier,...)
 │   └── graph.py            # Định nghĩa StateGraph và cấu hình SqliteSaver Checkpointer
-├── main.py                 # Khai báo API/Entrypoint (start_session, resume_session, cleanup)
+├── main.py                 # Hàm Python wrapper (start/resume_session, cleanup) — chưa có REST server
 ├── agent_sessions.db       # SQLite DB lưu checkpoint (tự động sinh)
 ├── agent_sessions.db-wal   # SQLite WAL file (tự động sinh)
 ├── agent_sessions.db-shm   # SQLite Shared Memory file (tự động sinh)
@@ -94,7 +100,7 @@ Chạy trực tiếp module chính:
 python main.py
 ```
 
-## 🧹 Database Maintenance & Thread Safety (FastAPI)
+## 🧹 Database Maintenance & Thread Safety
 
 Hệ thống sử dụng SQLite Checkpointer ở chế độ **WAL Mode** kết hợp cùng `threading.RLock()` (`db_lock`) để đồng bộ hóa truy cập checkpoint DB giữa các thread.
 

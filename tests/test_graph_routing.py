@@ -71,15 +71,16 @@ class TestRouteAfterVerifier:
         state = AgentState(user_input="x", final_status=None)
         assert route_after_verifier(state) == "node_4_coder"
 
-    def test_error_status_loops_back_to_coder(self):
+    def test_error_status_ends_graph_not_loops(self):
         """
-        LƯU Ý: route_after_verifier hiện tại chỉ dừng graph cho SUCCESS/FAILED_MAX_ITERATION.
-        final_status="ERROR" (nếu từng được set ở node_5_verifier) sẽ bị coi là "chưa xong"
-        và quay lại node_4_coder. Test này ghi lại hành vi HIỆN TẠI để nếu ai đổi logic
-        thì phải sửa test một cách có chủ đích, không phải vô tình.
+        THAY ĐỔI CÓ CHỦ Ý (trước đây final_status='ERROR' bị coi là 'chưa xong'
+        và quay lại node_4_coder — xem R6). Giờ MỌI final_status khác None đều
+        là terminal, kể cả 'ERROR' mà hiện chưa node nào thực sự gán (giá trị
+        này chỉ dùng ở tầng response dict của main.py khi graph.stream() lỗi
+        NGOÀI graph) — đóng sẵn khoảng hở phòng khi có node tương lai gán nó.
         """
         state = AgentState(user_input="x", final_status="ERROR")
-        assert route_after_verifier(state) == "node_4_coder"
+        assert route_after_verifier(state) == END
 
 
 class TestRouteAfterPlanDispatch:

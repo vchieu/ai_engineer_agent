@@ -10,12 +10,37 @@ from unittest.mock import patch, MagicMock
 from schemas.payload import (
     AgentState, RouterDecision, MissingFieldRequest,
     PlanSchema, DiagnosisSchema, PlanAudit,
+    SandboxResult, CodeFixProposal, FileChange, VerifierAudit,
 )
 from agent.nodes import (
     node_2b_cleaner, node_1_router, node_terminal_missing_info,
     node_2a_planner, node_3b_diagnosis, node_plan_dispatch,
-    node_3c_plan_reviewer,
+    node_3c_plan_reviewer, node_plan_human_interrupt, node_5_verifier,
+    _redact_secrets,
 )
+
+
+class TestRedactSecrets:
+    """Regression test cho việc redact secret trước khi lưu HistoryEntry vào
+    checkpoint DB (không redact ở prompt Verifier cùng vòng lặp)."""
+
+    def test_redacts_password_assignment(self):
+        assert "hunter2" not in _redact_secrets("Error: password=hunter2 invalid")
+
+    def test_redacts_bearer_token(self):
+        out = _redact_secrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc")
+        assert "eyJhbGciOiJIUzI1NiJ9" not in out
+
+    def test_redacts_aws_access_key_pattern(self):
+        out = _redact_secrets("AWS key AKIAABCDEFGHIJKLMNOP leaked")
+        assert "AKIAABCDEFGHIJKLMNOP" not in out
+
+    def test_does_not_touch_normal_output(self):
+        text = "ZeroDivisionError: division by zero"
+        assert _redact_secrets(text) == text
+
+    def test_empty_string_passthrough(self):
+        assert _redact_secrets("") == ""
 
 
 class TestNodeCleaner:
@@ -148,6 +173,22 @@ class TestNodePlanDispatch:
         result = node_plan_dispatch(state)
         assert result.review_strategy == "human_review"
 
+    def test_touching_critical_file_via_full_relative_path_triggers_human_review(self):
+        """Regression test cho bug: trước đây CRITICAL_FILES so khớp full path
+        thay vì basename, nên 'schemas/payload.py' (đường dẫn thật của project)
+        không khớp với 'payload.py' trong CRITICAL_FILES và lọt qua gate."""
+        state = self._diagnosis_state(affected_files=["schemas/payload.py"])
+        result = node_plan_dispatch(state)
+        assert result.review_strategy == "human_review"
+
+    def test_no_files_identified_triggers_llm_review_not_skip(self):
+        """Regression test: diagnosis tồn tại nhưng không tự sinh trạng thái
+        affected_files=[] được nữa (schema có min_length=1), nhưng path phòng thủ
+        khi cả plan lẫn diagnosis đều vắng mặt (files=[]) vẫn phải không skip_review."""
+        state = AgentState(user_input="sửa gì đó", intent="FIX_BUG")
+        result = node_plan_dispatch(state)
+        assert result.review_strategy == "llm_review"
+
     def test_force_human_review_overrides_everything(self):
         """force_human_review=True phải thắng tất cả các điều kiện khác, kể cả bug fix nhỏ."""
         state = self._diagnosis_state(affected_files=["utils.py"])
@@ -232,3 +273,122 @@ class TestPlanReviewerFallback:
         sent_prompt = mock_safe_call.call_args[0][2]
         assert "Không có Plan hoặc Diagnosis nào được tạo trước đó" in sent_prompt
         assert result.plan_review_retries == 1
+
+
+class TestNodePlanHumanInterrupt:
+    """
+    Regression test cho bug: node_plan_human_interrupt trước đây KHÔNG có giới
+    hạn số lần người dùng từ chối (khác với llm_review vốn có
+    max_plan_review_retries) -> có thể loop Planner/Diagnosis vô hạn.
+    Mock trực tiếp `agent.nodes.interrupt` (không cần chạy graph/checkpointer
+    thật) để mô phỏng phản hồi "reject" liên tục từ người dùng.
+    """
+
+    @patch("agent.nodes.interrupt")
+    def test_approve_routes_to_coder(self, mock_interrupt):
+        mock_interrupt.return_value = {"decision": "approve"}
+        state = AgentState(user_input="x", intent="FIX_BUG")
+
+        result = node_plan_human_interrupt(state)
+
+        assert result.goto == "node_4_coder"
+
+    @patch("agent.nodes.interrupt")
+    def test_single_reject_under_limit_loops_back_and_increments_counter(self, mock_interrupt):
+        mock_interrupt.return_value = {"decision": "reject", "feedback": "chưa ổn"}
+        state = AgentState(
+            user_input="x", intent="FIX_BUG",
+            human_review_retries=0, max_human_review_retries=3,
+        )
+
+        result = node_plan_human_interrupt(state)
+
+        assert result.goto == "node_3b_diagnosis"
+        assert result.update["human_review_retries"] == 1
+        assert result.update["plan_review_feedback"] == "chưa ổn"
+
+    @patch("agent.nodes.interrupt")
+    def test_reject_at_limit_routes_to_terminal_instead_of_looping_forever(self, mock_interrupt):
+        mock_interrupt.return_value = {"decision": "reject", "feedback": "vẫn chưa ổn"}
+        state = AgentState(
+            user_input="x", intent="FIX_BUG",
+            human_review_retries=2, max_human_review_retries=3,
+        )
+
+        result = node_plan_human_interrupt(state)
+
+        assert result.goto == "node_terminal_plan_rejected"
+        assert result.update["human_review_retries"] == 3
+
+    @patch("agent.nodes.interrupt")
+    def test_reject_routes_to_planner_for_new_feature(self, mock_interrupt):
+        mock_interrupt.return_value = {"decision": "reject", "feedback": "no"}
+        state = AgentState(
+            user_input="x", intent="NEW_FEATURE",
+            human_review_retries=0, max_human_review_retries=3,
+        )
+
+        result = node_plan_human_interrupt(state)
+
+        assert result.goto == "node_2a_planner"
+
+
+class TestNodeTerminalPlanRejected:
+    def test_message_reflects_both_llm_and_human_retry_counters(self):
+        from agent.nodes import node_terminal_plan_rejected
+        state = AgentState(
+            user_input="x", plan_review_retries=2, max_plan_review_retries=2,
+            human_review_retries=1, max_human_review_retries=3,
+        )
+
+        result = node_terminal_plan_rejected(state)
+
+        assert result.final_status == "FAILED_PLAN_REJECTED"
+        assert "2/2" in result.error_message
+        assert "1/3" in result.error_message
+
+
+class TestNodeVerifierDeterministicOverride:
+    """Regression test cho R7: audit.passed phải bị ép về False bằng CODE khi
+    sandbox thực tế fail, không phụ thuộc việc LLM có tuân thủ prompt hay không."""
+
+    def _proposal(self):
+        return CodeFixProposal(
+            explanation="fix", language="python", entrypoint_filename="main.py",
+            is_test_file=False, files=[FileChange(filename="main.py", content="print(1)")],
+        )
+
+    @patch("agent.nodes.safe_llm_call")
+    @patch("agent.nodes.execute_in_docker_sandbox")
+    def test_forces_passed_false_when_sandbox_fails_even_if_llm_says_true(self, mock_sandbox, mock_safe_call):
+        mock_sandbox.return_value = SandboxResult(
+            success=False, returncode=1, stdout="", stderr="boom", error_message="Exited with code 1"
+        )
+        # LLM "sai" (bỏ qua instruction trong prompt) vẫn trả passed=True dù sandbox fail.
+        mock_safe_call.return_value = (
+            VerifierAudit(passed=True, audit_feedback="trông ổn", confidence=0.9),
+            {"model_name": "gpt-test", "node_name": "node_5_verifier", "tokens": 5},
+        )
+        state = AgentState(user_input="x", intent="FIX_BUG", code_proposal=self._proposal())
+
+        result = node_5_verifier(state, llm_strong=MagicMock())
+
+        assert result.audit_result.passed is False
+        assert result.final_status != "SUCCESS"
+
+    @patch("agent.nodes.safe_llm_call")
+    @patch("agent.nodes.execute_in_docker_sandbox")
+    def test_keeps_passed_true_when_sandbox_succeeds_and_llm_agrees(self, mock_sandbox, mock_safe_call):
+        mock_sandbox.return_value = SandboxResult(
+            success=True, returncode=0, stdout="ok", stderr="", error_message=None
+        )
+        mock_safe_call.return_value = (
+            VerifierAudit(passed=True, audit_feedback="đạt", confidence=0.9),
+            {"model_name": "gpt-test", "node_name": "node_5_verifier", "tokens": 5},
+        )
+        state = AgentState(user_input="x", intent="FIX_BUG", code_proposal=self._proposal())
+
+        result = node_5_verifier(state, llm_strong=MagicMock())
+
+        assert result.audit_result.passed is True
+        assert result.final_status == "SUCCESS"

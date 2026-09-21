@@ -27,6 +27,12 @@ class TestIsSafeFilename:
         "../secret.py",          # traversal ra ngoài trực tiếp
         "a/../../b.py",          # traversal sau khi normalize ("../b.py")
         "..",                    # chỉ toàn dấu chấm
+        "C:boot.ini",            # Windows drive-relative path
+        "C:\\Windows\\System32\\evil.py",  # Windows absolute path
+        "D:/test.py",
+        "\\\\server\\share\\file.py",      # UNC path
+        "..\\..\\evil.py",       # traversal kiểu Windows trên host Linux
+        ".",                     # normalize về chính base dir -> IsADirectoryError khi open()
     ])
     def test_unsafe_filenames_rejected(self, filename):
         assert _is_safe_filename(filename) is False
@@ -114,3 +120,40 @@ class TestPlanAuditValidation:
         from schemas.payload import PlanAudit
         audit = PlanAudit(passed=True, identified_risks=["rủi ro nhỏ về hiệu năng"], audit_feedback="ok", confidence=0.9)
         assert audit.passed is True
+
+    def test_confidence_out_of_range_rejected(self):
+        """Item #15: confidence không có ràng buộc cận trước đây có thể nhận giá trị vô nghĩa (vd 5.0)."""
+        from pydantic import ValidationError
+        from schemas.payload import PlanAudit
+        with pytest.raises(ValidationError):
+            PlanAudit(passed=True, identified_risks=["r"], audit_feedback="ok", confidence=1.5)
+
+
+class TestResourceLimits:
+    """Item #4: chặn DoS token/RAM/disk bằng cách giới hạn kích thước input."""
+
+    def test_file_content_over_max_length_rejected(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            FileChange(filename="huge.py", content="x" * 300_001)
+
+    def test_file_content_at_max_length_accepted(self):
+        fc = FileChange(filename="ok.py", content="x" * 300_000)
+        assert len(fc.content) == 300_000
+
+    def test_plan_schema_rejects_empty_target_files(self):
+        """Item #3a: plan/diagnosis không xác định được file nào là trạng thái bất
+        thường — không nên lọt qua schema để rồi mặc định skip_review."""
+        from pydantic import ValidationError
+        from schemas.payload import PlanSchema
+        with pytest.raises(ValidationError):
+            PlanSchema(steps=["a"], target_files=[], acceptance_criteria="ok")
+
+    def test_diagnosis_schema_rejects_empty_affected_files(self):
+        from pydantic import ValidationError
+        from schemas.payload import DiagnosisSchema
+        with pytest.raises(ValidationError):
+            DiagnosisSchema(
+                root_cause="x", affected_files=[],
+                suggested_approach="y", acceptance_criteria="z",
+            )

@@ -58,17 +58,36 @@ def route_after_plan_review(
 
 
 def route_after_verifier(state: AgentState) -> Literal["node_4_coder", "__end__"]:
-    if state.final_status in ["SUCCESS", "FAILED_MAX_ITERATION"]:
-        return END
-    return "node_4_coder"
+    # Trước đây chỉ END khi final_status in ["SUCCESS", "FAILED_MAX_ITERATION"] —
+    # về mặt lý thuyết, không node nào trong nodes.py hiện set final_status="ERROR"
+    # (giá trị "ERROR" trong FinalStatusType chỉ được main.py dùng ở tầng response
+    # dict khi graph.stream() ném exception RA NGOÀI graph, không phải giá trị
+    # được ghi vào state rồi feed lại cho route này). Tuy nhiên nếu sau này có
+    # thêm node nào set final_status="ERROR" hoặc 1 trạng thái terminal khác, để
+    # route dựa theo whitelist 2 giá trị cụ thể là 1 bẫy dễ quên cập nhật.
+    # Đảo lại logic: BẤT KỲ final_status nào đã được set (khác None) đều là
+    # terminal -> END; chỉ None (chưa quyết định) mới tiếp tục vòng lặp Coder.
+    if state.final_status is None:
+        return "node_4_coder"
+    return END
 
 
 def extract_interrupt_data(state_snapshot: Any) -> Optional[Dict[str, Any]]:
-    if not state_snapshot or not getattr(state_snapshot, "tasks", None):
+    # `task.interrupts[0].value` phụ thuộc cấu trúc nội bộ của LangGraph — có thể
+    # đổi giữa các phiên bản. Bọc try/except để lỗi cấu trúc trả về None (coi như
+    # "không có interrupt") thay vì làm crash toàn bộ start/resume_agent_session.
+    if not state_snapshot:
         return None
-    for task in state_snapshot.tasks:
-        if hasattr(task, "interrupts") and task.interrupts:
-            return task.interrupts[0].value
+    try:
+        tasks = getattr(state_snapshot, "tasks", None)
+        if not tasks:
+            return None
+        for task in tasks:
+            interrupts = getattr(task, "interrupts", None)
+            if interrupts:
+                return interrupts[0].value
+    except (AttributeError, IndexError, TypeError):
+        return None
     return None
 
 

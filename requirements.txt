@@ -1,8 +1,16 @@
-langgraph>=0.2.0
-langgraph-checkpoint>=2.0.25
-langgraph-checkpoint-sqlite>=2.0.0
-langchain-core>=0.3.0
-langchain-openai>=0.1.0
-pydantic>=2.0.0
-docker>=7.0.0
-python-dotenv>=1.0.0
+# LƯU Ý: pin bằng "==" thay vì ">=" để đảm bảo reproducibility cho các package
+# TRỰC TIẾP. Đây KHÔNG phải 1 lockfile đầy đủ (không khóa transitive dependencies)
+# vì môi trường tạo file này không có mạng để chạy `pip-compile`/`uv pip compile`.
+# Khuyến nghị: chạy `pip freeze > requirements.lock.txt` trong 1 venv đã cài thành
+# công và commit thêm file lock đó, hoặc chuyển sang `pip-tools`/`uv`/`poetry` để
+# quản lý lock file tự động và có thể update an toàn.
+langgraph==0.2.0
+langgraph-checkpoint==2.0.25
+langgraph-checkpoint-sqlite==2.0.0
+langchain-core==0.3.0
+langchain-openai==0.1.0
+pydantic==2.0.0
+docker==7.0.0
+python-dotenv==1.0.0
+pytest==8.0.0
+pytest-cov==5.0.0
